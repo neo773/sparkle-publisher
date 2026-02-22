@@ -3,20 +3,19 @@
 set -e  # Exit on any error
 
 # Configuration
-NAME="<Your App Name>"
-NAME_LOWER=$(echo "$NAME" | tr '[:upper:]' '[:lower:]')  # macOS-compatible lowercase conversion
+NAME="mactranscribe"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CHANGELOG="$PROJECT_ROOT/Changelog.md"
-S3_BUCKET="s3://<Your Bucket>"
-S3_BASE_URL="<Your CDN Base URL>"
-WEBSITE="<Your App Website>"
-SIGN_UPDATE_TOOL="$PROJECT_ROOT/Utilities/Sparkle/sign_update"
+WEBSITE="https://github.com/neo773/mactranscribe"
 GENERATE_APPCAST_TOOL="$PROJECT_ROOT/Utilities/Sparkle/generate_appcast"
-CLOUDFRONT_DISTRIBUTION_ID="<Your CloudFront Distribution ID>"
+
+# GitHub configuration
+GITHUB_RELEASES_REPO="neo773/mactranscribe-releases"
+GITHUB_PAGES_URL="https://neo773.github.io/mactranscribe-releases"
 
 # Check if DMG is provided
 if [[ -z "$1" ]]; then
-    echo "❌ No DMG file provided!"
+    echo "No DMG file provided!"
     echo "Usage: ./publish-update.sh /path/to/dmg"
     exit 1
 fi
@@ -27,8 +26,8 @@ PARTIAL_APPCAST_FILE="$UPDATE_DIR/partial_update.xml"
 APPCAST_FILE="$UPDATE_DIR/update.xml"
 EXISTING_APPCAST_FILE="$UPDATE_DIR/existing_update.xml"
 
-# Generate `update.xml` using local DMG instead of reading from S3
-echo "📝 Generating Sparkle appcast..."
+# Generate `update.xml` using local DMG
+echo "Generating Sparkle appcast..."
 "$GENERATE_APPCAST_TOOL" --link "$WEBSITE" -o "$PARTIAL_APPCAST_FILE" "$UPDATE_DIR"
 
 # Extract version & build using awk (compatible with macOS)
@@ -36,19 +35,17 @@ VERSION=$(awk -F '[<>]' '/<sparkle:shortVersionString>/ {print $3}' "$PARTIAL_AP
 BUILD=$(awk -F '[<>]' '/<sparkle:version>/ {print $3}' "$PARTIAL_APPCAST_FILE")
 
 if [[ -z "$VERSION" || -z "$BUILD" ]]; then
-    echo "❌ Failed to extract version or build from appcast!"
+    echo "Failed to extract version or build from appcast!"
     exit 1
 fi
 
-echo "🏷️ Extracted version: $VERSION, build: $BUILD"
+echo "Extracted version: $VERSION, build: $BUILD"
 
-# Define paths
-S3_UPDATE_PATH="apps/${NAME_LOWER}/updates/$VERSION-$BUILD/${NAME}.dmg"
-S3_LATEST_PATH="apps/${NAME_LOWER}/${NAME}.dmg"
-S3_APPCAST_PATH="apps/${NAME_LOWER}/updates/update.xml"
-CORRECT_URL="$S3_BASE_URL/$S3_UPDATE_PATH"
+# GitHub Release tag and download URL
+RELEASE_TAG="v${VERSION}-${BUILD}"
+DMG_DOWNLOAD_URL="https://github.com/${GITHUB_RELEASES_REPO}/releases/download/${RELEASE_TAG}/${NAME}.dmg"
 
-# 🔍 Extract changelog for this version (INCLUDING title)
+# Extract changelog for this version (INCLUDING title)
 CHANGELOG_CONTENT=$(awk -v version="$VERSION" -v build="$BUILD" '
     BEGIN {found=0}
     $0 ~ "^## " version " \\(" build "\\) " {found=1}  # Start capturing from title
@@ -57,7 +54,7 @@ CHANGELOG_CONTENT=$(awk -v version="$VERSION" -v build="$BUILD" '
 ' "$CHANGELOG")
 
 if [[ -z "$CHANGELOG_CONTENT" ]]; then
-    echo "⚠️ No changelog entry found for version $VERSION (Build $BUILD)."
+    echo "No changelog entry found for version $VERSION (Build $BUILD)."
     exit 1
 fi
 
@@ -73,52 +70,49 @@ EOF
 )
 
 # Show preview in plain text
-echo "🔎 Changelog Preview (Plain Text):"
+echo "Changelog Preview:"
 echo "---------------------------------------------------------"
 echo "$CHANGELOG_CONTENT"
 echo "---------------------------------------------------------"
-
-# Show preview in HTML format
-#echo "🔎 Changelog Preview (HTML Format):"
-#echo "---------------------------------------------------------"
-#echo "$CHANGELOG_HTML"
-#echo "---------------------------------------------------------"
 
 # Ask for confirmation before proceeding
 echo -n "Proceed with creating update (y/n)? "
 read answer
 if [[ "$answer" != "${answer#[Nn]}" ]]; then
-    echo "❌ Update canceled."
+    echo "Update canceled."
     exit 1
 fi
 
-# Wrap the HTML in a <div>
-FULL_CHANGELOG_HTML=$(cat <<EOF
-<div>
-    $CHANGELOG_HTML
-</div>
-EOF
-)
+# Clone gh-pages branch to a temp directory for appcast management
+GHPAGES_TMPDIR=$(mktemp -d)
+trap 'rm -rf "$GHPAGES_TMPDIR"' EXIT
 
-# Check if an existing update.xml exists
-if aws s3 ls "$S3_BUCKET/$S3_APPCAST_PATH" > /dev/null 2>&1; then
-    echo "📡 Found existing update.xml. Downloading..."
-    aws s3 cp "$S3_BUCKET/$S3_APPCAST_PATH" "$EXISTING_APPCAST_FILE"
-    APPCAST_EXISTS=true
-    # 🚨 Check if this version already exists
-    if grep -q "<sparkle:version>$BUILD</sparkle:shortVersionString>" "$EXISTING_APPCAST_FILE"; then
-        echo "❌ Build $BUILD already exists in update.xml!"
-        echo "⚠️ Aborting to prevent duplicate versions."
-        exit 1
+echo "Fetching existing appcast from gh-pages branch..."
+if git clone --branch gh-pages --single-branch --depth 1 \
+    "https://github.com/${GITHUB_RELEASES_REPO}.git" "$GHPAGES_TMPDIR" 2>/dev/null; then
+
+    if [[ -f "$GHPAGES_TMPDIR/update.xml" ]]; then
+        cp "$GHPAGES_TMPDIR/update.xml" "$EXISTING_APPCAST_FILE"
+        APPCAST_EXISTS=true
+
+        # Check for duplicate build
+        if grep -q "<sparkle:version>${BUILD}</sparkle:version>" "$EXISTING_APPCAST_FILE"; then
+            echo "Build $BUILD already exists in update.xml!"
+            echo "Aborting to prevent duplicate versions."
+            exit 1
+        fi
+    else
+        echo "gh-pages branch exists but no update.xml found. Creating fresh appcast."
+        APPCAST_EXISTS=false
     fi
 else
-    echo "⚠️ No existing update.xml found. Using new appcast only."
-    APPCAST_EXISTS=false
+    echo "No gh-pages branch found. Run the one-time setup first."
+    exit 1
 fi
 
 # Merge old appcast (if exists) or use the new one
 if [[ "$APPCAST_EXISTS" == true ]]; then
-    echo "🔄 Merging new update into existing appcast..."
+    echo "Merging new update into existing appcast..."
 
     # Copy everything up to <channel> (keep header and opening tag)
     awk '/<channel>/ {print; exit} {print}' "$EXISTING_APPCAST_FILE" > "$APPCAST_FILE"
@@ -131,39 +125,50 @@ if [[ "$APPCAST_EXISTS" == true ]]; then
 
     # Close the channel properly
     echo "</channel></rss>" >> "$APPCAST_FILE"
-
 else
-    echo "✅ Using new appcast as the final update.xml (no existing history)."
+    echo "Using new appcast as the initial update.xml."
     cp "$PARTIAL_APPCAST_FILE" "$APPCAST_FILE"
 fi
 
 # Inject changelog into `update.xml`
 perl -i -pe "s{</item>}{<description><![CDATA[$FULL_CHANGELOG_HTML]]></description>\n</item>}g" "$APPCAST_FILE"
 
-# Replace incorrect enclosure URL with the correct one
-perl -i -pe "s{<enclosure url=\"[^\"]*\"}{<enclosure url=\"$CORRECT_URL\"}g" "$APPCAST_FILE"
+# Replace enclosure URL with GitHub Releases download URL
+perl -i -pe "s{<enclosure url=\"[^\"]*\"}{<enclosure url=\"$DMG_DOWNLOAD_URL\"}g" "$APPCAST_FILE"
 
-# Show preview of `update.xml`
-#echo "🔎 Appcast Preview:"
-#echo "---------------------------------------------------------"
-#cat "$APPCAST_FILE"
-#echo "---------------------------------------------------------"
-
-# Ask for final confirmation before uploading
-echo -n "Proceed with uploading the update to S3? (y/n)? "
+# Ask for final confirmation before publishing
+echo -n "Proceed with creating GitHub release and publishing appcast? (y/n) "
 read answer
 if [[ "$answer" != "${answer#[Nn]}" ]]; then
-    echo "❌ Upload canceled."
+    echo "Upload canceled."
     exit 1
 fi
 
-# Upload DMG to S3
-echo "☁️ Uploading release to S3..."
-aws s3 cp "$DMG_FILE" "$S3_BUCKET/$S3_UPDATE_PATH"
-aws s3 cp "$APPCAST_FILE" "$S3_BUCKET/$S3_APPCAST_PATH"
-# Copy the remote DMG to release path instead of re-uploading
-aws s3 cp "$S3_BUCKET/$S3_UPDATE_PATH" "$S3_BUCKET/$S3_LATEST_PATH"
+# Create GitHub Release and upload DMG
+echo "Creating GitHub release ${RELEASE_TAG}..."
+if gh release view "$RELEASE_TAG" --repo "$GITHUB_RELEASES_REPO" > /dev/null 2>&1; then
+    echo "Release ${RELEASE_TAG} already exists. Uploading DMG to existing release..."
+    gh release upload "$RELEASE_TAG" "$DMG_FILE" \
+        --repo "$GITHUB_RELEASES_REPO" \
+        --clobber
+else
+    gh release create "$RELEASE_TAG" "$DMG_FILE" \
+        --repo "$GITHUB_RELEASES_REPO" \
+        --title "${NAME} ${VERSION} (${BUILD})" \
+        --notes "$CHANGELOG_CONTENT"
+fi
 
-aws cloudfront create-invalidation --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" --paths "/$S3_UPDATE_PATH" "/$S3_LATEST_PATH" "/$S3_APPCAST_PATH"
+# Update appcast on gh-pages branch
+echo "Publishing appcast to GitHub Pages..."
+cp "$APPCAST_FILE" "$GHPAGES_TMPDIR/update.xml"
 
-echo "🎉 Done. Release is now live!"
+ORIGINAL_DIR="$(pwd)"
+cd "$GHPAGES_TMPDIR"
+git add update.xml
+git commit -m "Update appcast for ${VERSION} (${BUILD})"
+git push origin gh-pages
+cd "$ORIGINAL_DIR"
+
+echo "Done. Release is live!"
+echo "  DMG: $DMG_DOWNLOAD_URL"
+echo "  Appcast: ${GITHUB_PAGES_URL}/update.xml"

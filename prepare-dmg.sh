@@ -3,12 +3,12 @@
 set -e  # Exit on any error
 
 # Configuration
-NAME="<Your App Name>"
+NAME="mactranscribe"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/Build"
 DMG_LAYOUT_FOLDER="$PROJECT_ROOT/DMG"
 NOTARY_PROFILE="notarytool"
-DEVELOPER_ID="<Your Developer ID>"
+DEVELOPER_ID="K863L9K6BU"
 
 echo "🔍 Searching for builds..." >&2
 AVAILABLE_BUILDS=()
